@@ -38,6 +38,8 @@ class NAGL(nn.Module):
         self.afl_ca, self.afl_sa = self.attention_module() # AFL Module
         self.pe_layer = PositionEmbeddingSine(self.hidden_dim//2, normalize=True)
 
+        self.layer_norm = nn.LayerNorm(self.hidden_dim, elementwise_affine=False)
+
         # losses
         self.cross_entropy_loss = nn.CrossEntropyLoss()
         self.focal_loss = FocalLoss()
@@ -59,11 +61,12 @@ class NAGL(nn.Module):
         return cross_attention, self_attention
 
     @torch.no_grad()
-    def feature_forward(self, image):
+    def feature_forward(self, image, n):
         # get images features from vision encoder
         b, num, c, h, w = image.shape
-        feat = self.vision_encoder.get_intermediate_layers(image.view(-1, c, h, w).to('cuda'))[0]
-        feat = feat.view(b, num, -1, self.hidden_dim)
+        feat = self.vision_encoder.get_intermediate_layers(image.view(-1, c, h, w).to('cuda'), n=n)
+        feat = [_.view(b, num, -1, self.hidden_dim) for _ in feat]
+        feat = [self.layer_norm(_) for _ in feat]
         return feat
     
     def get_mask(self, mask, target_size):
@@ -79,7 +82,7 @@ class NAGL(nn.Module):
         mask = rearrange(mask, '(b num) 1 p_h p_w -> b num (p_h p_w)', b=b).unsqueeze(-1)
         return mask
     
-    def nn_search(self, query_feat, support_feat, support_mask=None, mode='max'):
+    def nn_search(self, query_feat, support_feat, support_mask=None, mode='max', mask=False):
         '''
         query_feat: (b, num_q, M, c)
         support_feat: (b, num_s, N, c)
@@ -98,6 +101,8 @@ class NAGL(nn.Module):
             support_mask_ = None
             support_mask = 1
 
+        if mask: return support_mask_
+
         similarity_map = (1+torch.einsum('bmc,bnc->bmn', query_feat, support_feat))/2*support_mask
         if mode == 'max':
             pseudo_mask = similarity_map.max(dim=-1)[0]
@@ -105,7 +110,7 @@ class NAGL(nn.Module):
             pseudo_mask = similarity_map.mean(dim=-1)
         pseudo_mask = rearrange(pseudo_mask, 'b (num_q M) -> b num_q M 1', num_q=num_q)
 
-        return pseudo_mask, support_mask_
+        return pseudo_mask
 
     def attention_forward(self, cross_layer, self_layer, query_embed, key_feat, value_feat, feat_mask=None):
         '''
@@ -179,64 +184,63 @@ class NAGL(nn.Module):
         return image_tensor, grid_size
     
     def forward(self, args, query_image, query_mask, query_label, support_normal, support_abnormal, mode='train'):
+        n = [7, 9, 11]
 
-        query_feat = self.feature_forward(query_image)
+        query_feat = self.feature_forward(query_image, n)
 
-        loss_i = 0
-        loss_p = 0
+        support_n_image, support_n_mask_ = support_normal
+        support_n_feat = self.feature_forward(support_n_image, n)
 
-        if args.n_shot>0:
-            support_n_image, support_n_mask_ = support_normal
-            support_n_feat = self.feature_forward(support_n_image)
-            n_pseudo_mask, support_n_mask = self.nn_search(query_feat, support_n_feat, 1-support_n_mask_)
-            s_n = n_pseudo_mask.squeeze(-1)
+        s_ns = []
+        for i in range(len(query_feat)):
+            n_pseudo_mask = self.nn_search(query_feat[i], support_n_feat[i], 1-support_n_mask_)
+            s_ns.append(n_pseudo_mask.squeeze(-1))
+        s_n = torch.stack(s_ns).mean(dim=0)
         
-        if args.a_shot>0:
-            support_a_image, support_a_mask_ = support_abnormal
-            support_a_feat = self.feature_forward(support_a_image)
-            _, support_a_mask = self.nn_search(query_feat, support_a_feat, support_a_mask_)
+        support_a_image, support_a_mask_ = support_abnormal
+        support_a_feat = self.feature_forward(support_a_image, n)
+        support_a_mask = self.nn_search(query_feat[0], support_a_feat[0], support_a_mask_, mask=True)
 
-            if args.n_shot==0: # only abnormal as reference, abtain normal reference from abnormal image
-                support_n_feat = support_a_feat.masked_select((1-support_a_mask).bool()).view(support_a_feat.shape[0], 1, -1, support_a_feat.shape[-1]) 
-                n_pseudo_mask, support_n_mask = self.nn_search(query_feat, support_a_feat, 1-support_a_mask_)
-                s_n = n_pseudo_mask.squeeze(-1)
-
+        s_as = []
+        for i in range(len(query_feat)):
             # RM Module forward
-            support_res_feat = self.get_res_feat(support_a_feat, support_n_feat)
-            residual_proxies = self.attention_forward(self.rm_ca, self.rm_sa, self.learnable_proxies, support_a_feat, support_res_feat, support_a_mask)
-
+            support_res_feat = self.get_res_feat(support_a_feat[i], support_n_feat[i])
+            residual_proxies = self.attention_forward(self.rm_ca, self.rm_sa, self.learnable_proxies, support_a_feat[i], support_res_feat, support_a_mask)
             # AFL Module forward
-            query_res_feat = self.get_res_feat(query_feat, support_n_feat)
-            anomaly_proxies = self.attention_forward(self.afl_ca, self.afl_sa, residual_proxies, query_res_feat, query_feat, None).unsqueeze(1)
-            
-            a_out, _ = self.nn_search(query_feat, anomaly_proxies, mode='mean')
-            s_a = a_out.squeeze(-1)
-        
-        if args.n_shot>0 and args.a_shot==0:
-            s_a = 1-s_n
-        elif args.n_shot==0 and args.a_shot>0:
-            s_n = 1-s_a
-        else:
-            assert args.n_shot>0 or args.a_shot>0, 'n_shot and a_shot should not be both 0'
+            query_res_feat = self.get_res_feat(query_feat[i], support_n_feat[i])
+            anomaly_proxies = self.attention_forward(self.afl_ca, self.afl_sa, residual_proxies, query_res_feat, query_feat[i], None).unsqueeze(1)
+            a_out = self.nn_search(query_feat[i], anomaly_proxies, mode='mean')
+            s_as.append(a_out.squeeze(-1))
+        s_a = torch.stack(s_as).mean(dim=0)
 
-        pixel_level_logits = torch.cat([s_n, s_a], dim=1) # (b, 2, h*w)
-        
         a_score = (s_a+(1-s_n))/2
 
         if mode == 'train':
-            a_score_topk = torch.topk(a_score, 20, dim=-1)[0].mean(dim=-1)
-            image_level_logits = torch.cat([1-a_score_topk, a_score_topk], dim=-1)
+            loss_i = 0
+            loss_p = 0
 
             # Image Level
+            a_score_topk = torch.topk(a_score, 20, dim=-1)[0].mean(dim=-1)
+            image_level_logits = torch.cat([1-a_score_topk, a_score_topk], dim=-1)
             loss_i += self.cross_entropy_loss(image_level_logits, query_label.long())
 
             # Pixel Level
+            pixel_level_logits = torch.cat([1 - a_score, a_score], dim=1)
             l = int(pixel_level_logits.shape[-1]**0.5)
             pixel_level_logits = rearrange(pixel_level_logits, 'b n (h w) -> b n h w', h=l)
             pixel_level_logits = F.interpolate(pixel_level_logits, size=query_mask.shape[-2:], mode='bilinear')
             query_mask_n = torch.stack([1-query_mask, query_mask], dim=1)
             loss_p += self.focal_loss(pixel_level_logits, query_mask_n)
             loss_p += self.dice_loss(pixel_level_logits, query_mask_n)
+
+            a_out = s_a.squeeze()
+            query_mask = self.get_mask(query_mask.unsqueeze(1), int(query_feat[0].shape[-2] ** 0.5)).squeeze()
+            ab_idxs = torch.where(query_mask == 1)
+            if ab_idxs[0].numel() > 0:
+                loss_p += 1 - torch.mean(a_out[ab_idxs[0], ab_idxs[1]])
+            n_idxs = torch.where(query_mask == 0)
+            if n_idxs[0].numel() > 0:
+                loss_p += torch.mean(a_out[n_idxs[0], n_idxs[1]])
 
             return image_level_logits, pixel_level_logits, loss_i, loss_p
         

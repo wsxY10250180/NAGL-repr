@@ -3,7 +3,7 @@
 #SBATCH --partition=mixed
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=2
-#SBATCH --output=./outputs/train_on_visa.txt
+#SBATCH --output=./outputs/multi_patchloss.txt
 
 python train.py \
   --data_root /gpool/home/wangshaoxiong/dataset \
@@ -15,4 +15,4 @@ python train.py \
   --n_shot 1 \
   --a_shot 1 \
   --num_learnable_proxies 25 \
-  --save_path ./outputs/train_on_visa
+  --save_path ./outputs/multi_patchloss

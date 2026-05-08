@@ -1,0 +1,11 @@
+CUDA_VISIBLE_DEVICES=0 python train.py \
+  --data_root /gpool/home/wangshaoxiong/dataset \
+  --fold 1 \
+  --epoch 20 \
+  --batch_size 8 \
+  --image_size 448 \
+  --print_freq 50 \
+  --n_shot 1 \
+  --a_shot 1 \
+  --num_learnable_proxies 25 \
+  --save_path ./outputs/multi_patchloss_layer_norm > ./outputs/multi_patchloss_layer_norm.txt 2>&1 &
