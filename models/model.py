@@ -62,7 +62,7 @@ class NAGL(nn.Module):
     def feature_forward(self, image):
         # get images features from vision encoder
         b, num, c, h, w = image.shape
-        feat = self.vision_encoder.get_intermediate_layers(image.view(-1, c, h, w))[0]
+        feat = self.vision_encoder.get_intermediate_layers(image.view(-1, c, h, w).to('cuda'))[0]
         feat = feat.view(b, num, -1, self.hidden_dim)
         return feat
     
@@ -71,7 +71,7 @@ class NAGL(nn.Module):
         mask: (b, num, h, w)
         '''
         b, _, _, _ = mask.shape
-        mask = rearrange(mask, 'b num h w -> (b num) h w').unsqueeze(1)
+        mask = rearrange(mask, 'b num h w -> (b num) h w').unsqueeze(1).to('cuda')
         mask = self.mask_downsample(mask)
         mask[mask>=1] = 1
         if mask.shape[-2] != target_size:

@@ -1,14 +1,14 @@
 import os
 import torch
 from torch.utils.data import DataLoader
-import torch.distributed as dist
 import argparse
 
 from utils.utils import setup_seed, get_transform
 from models.model import NAGL
 from utils.dataset import FSDataset
 
-# import time
+os.environ["HTTP_PROXY"] = "http://10.99.248.16:10808"
+os.environ["HTTPS_PROXY"] = "http://10.99.248.16:10808"
 
 from utils.metrics import FewShotMetric
 
@@ -91,23 +91,18 @@ if __name__ == '__main__':
 
     # Set seed
     setup_seed(args.seed)
-    if os.path.exists(f'{args.save_path}/n_{args.n_shot}_a_{args.a_shot}_best.pth'):
+    if not os.path.exists(args.save_path):
+        os.makedirs(args.save_path)
+    if os.path.exists(f'{args.save_path}/n_{args.n_shot}_a_{args.a_shot}_i_best.pth') and os.path.exists(f'{args.save_path}/n_{args.n_shot}_a_{args.a_shot}_p_best.pth'):
         print(f"Results for N-Shot = {args.n_shot}, A-Shot = {args.a_shot} already exist. Skipping.")
         exit()
 
-    # Distributed setting
-    local_rank = args.local_rank
-    dist.init_process_group(backend='nccl')
-    print('local_rank: ', local_rank)
-    torch.cuda.set_device(local_rank)
-    args.device = torch.device('cuda', local_rank)
+    args.device = torch.device('cuda')
 
     # Create model
     model = NAGL(args)
     # Device setup
     model.to(args.device)
-    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
 
     # Freeze parameters
     freeze_params_key_name = ['vision_encoder', 
@@ -118,7 +113,7 @@ if __name__ == '__main__':
     trainable_num = 0
     print(f"Trainable Parameters: ")
     for param_name, param in model.named_parameters():
-        if (param_name.split('.')[1] not in freeze_params_key_name):
+        if param_name.split('.')[0] not in freeze_params_key_name:
             print(param_name, param.shape)
             trainable_num += param.numel()
             param.requires_grad_(True)
@@ -149,12 +144,11 @@ if __name__ == '__main__':
                            shot=[args.n_shot, args.a_shot], 
                            transform=transform)
 
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_data, shuffle=True)
-    train_dataloader = DataLoader(train_data, 
+    train_dataloader = DataLoader(train_data,
                                   batch_size=args.batch_size, 
                                   pin_memory=True, 
                                   num_workers=args.worker, 
-                                  sampler=train_sampler)
+                                  shuffle=True)
     
     val_data = FSDataset(data_root=args.data_root,
                            data_mode=args.data_mode,
@@ -163,15 +157,15 @@ if __name__ == '__main__':
                            shot=[args.n_shot, args.a_shot], 
                            transform=transform)
 
-    val_sampler = torch.utils.data.distributed.DistributedSampler(val_data, shuffle=False)
     val_dataloader = DataLoader(val_data,
                                 batch_size=args.batch_size, 
                                 pin_memory=True, 
                                 num_workers=args.worker, 
-                                sampler=val_sampler)
+                                shuffle=False)
 
     # Training and validation
-    best_roc = 0
+    best_i_roc = 0
+    best_p_roc = 0
     for epoch in range(args.epoch):
         print(f'Epoch: {epoch}, Learning Rate: {scheduler.get_last_lr()[0]}')
         print(f'----------Train-----------')
@@ -193,16 +187,20 @@ if __name__ == '__main__':
                                        training=False)
             print(f'Val Results \t || I-AUROC: {mean_i_roc:.4f}, P-AUROC: {mean_p_roc:.4f}, Loss: {mean_loss:.4f}\n')
 
-            if (epoch >= 5) and (mean_i_roc + mean_p_roc >= best_roc):
-                best_epoch = epoch
+            if (epoch >= 5) and (mean_i_roc >= best_i_roc):
+                best_i_epoch = epoch
                 best_i_roc = mean_i_roc
-                best_p_roc = mean_p_roc
-                best_roc = best_i_roc + best_p_roc
                 # save the best model
-                torch.save({name: param for name, param in model.named_parameters() if param.requires_grad}, f'{args.save_path}/n_{args.n_shot}_a_{args.a_shot}_best.pth')
-            
+                torch.save({name: param for name, param in model.named_parameters() if param.requires_grad}, f'{args.save_path}/n_{args.n_shot}_a_{args.a_shot}_i_best.pth')
+
+            if (epoch >= 5) and (mean_p_roc >= best_p_roc):
+                best_p_epoch = epoch
+                best_p_roc = mean_p_roc
+                # save the best model
+                torch.save({name: param for name, param in model.named_parameters() if param.requires_grad}, f'{args.save_path}/n_{args.n_shot}_a_{args.a_shot}_p_best.pth')
+
             if epoch < 5:
                 print(f'Warmup Epoch {epoch} \n')
             else:
-                print(f'Previous Best I-AUROC: {best_i_roc:.4f}({best_epoch}) || Best P-AUROC: {best_p_roc:.4f}({best_epoch}) \n')
+                print(f'Previous Best I-AUROC: {best_i_roc:.4f}({best_i_epoch}) || Best P-AUROC: {best_p_roc:.4f}({best_p_epoch}) \n')
     

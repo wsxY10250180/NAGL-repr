@@ -196,9 +196,13 @@ class FSDataset(Dataset):
         query_idx, query_data = self.random_sample(self.metadata[sample_product][query_type][query_specie_type], 1)
         
         # check if query image is in support set
-        if ((query_idx in support_normal_idx and query_type == 'normal') or 
-            (query_idx in support_abnormal_idx and query_type == 'abnormal')):
-            self.load_frame()
+        while True:
+            if query_idx[0] in support_normal_idx and query_type == 'normal':
+                support_normal_idx, support_normal = self.random_sample(self.metadata[sample_product]['normal'][support_normal_specie_type], self.n_shot)
+            elif query_idx[0] in support_abnormal_idx and query_type == 'abnormal':
+                support_abnormal_idx, support_abnormal = self.random_sample(self.metadata[sample_product]['abnormal'][support_abnormal_specie_type], self.a_shot)
+            else:
+                break
 
         # Get query image
         query_tuple = self.read_data(query_data)

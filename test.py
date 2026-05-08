@@ -54,6 +54,7 @@ def parse_args():
 if __name__=="__main__":
 
     args = parse_args()
+    args.tag = os.path.basename(args.save_path)
     
     print(f"Requested to run {len(args.n_shots)} (different) shot(s):", args.n_shots)
     print(f"Requested to repeat the experiments {args.num_seeds} time(s).")
@@ -68,94 +69,100 @@ if __name__=="__main__":
         seeds = [args.just_seed]
     else:
         seeds = range(args.num_seeds)
-    
-    result_root = f"results/{args.model_name}_{args.image_size}"
-    delete_anomlay_maps = True
 
-    for n_shot in list(args.n_shots):
-        for a_shot in list(args.a_shots):
-            args.n_shot = n_shot
-            args.a_shot = a_shot
-            model = NAGL(args)
-            model.to(args.device)
-            # Load checkpoint
-            if a_shot>0:
-                ckpt = torch.load(f'{args.save_path}/n_{n_shot}_a_{a_shot}_best.pth')
-                print(f"Loading checkpoint from {args.save_path}/n_{n_shot}_a_{a_shot}_best.pth")
-                for name, param in ckpt.items():
-                    if 'module' in name:
-                        name = name[7:]
-                    # set the model parameters by name
-                    if name in model.state_dict().keys():
-                        model.state_dict()[name].copy_(param)
-                        print(f"Loaded {name} from checkpoint.")
+    def evaluation(cls, seg, mode):
+        result_root = "results"
+        delete_anomlay_maps = False
+
+        for n_shot in list(args.n_shots):
+            for a_shot in list(args.a_shots):
+                args.n_shot = n_shot
+                args.a_shot = a_shot
+                model = NAGL(args)
+                model.to(args.device)
+                # Load checkpoint
+                if a_shot>0:
+                    ckpt = torch.load(f'{args.save_path}/n_{n_shot}_a_{a_shot}_{mode}_best.pth')
+                    print(f"Loading checkpoint from {args.save_path}/n_{n_shot}_a_{a_shot}_{mode}_best.pth")
+                    for name, param in ckpt.items():
+                        if 'module' in name:
+                            name = name[7:]
+                        # set the model parameters by name
+                        if name in model.state_dict().keys():
+                            model.state_dict()[name].copy_(param)
+                            print(f"Loaded {name} from checkpoint.")
+                        else:
+                            print(f"Warning: {name} not in model state_dict.")
+                model.eval()
+
+                results_dir_suffix = f"{n_shot}-n_shot_{a_shot}-a_shot"
+                results_dir = os.path.join(result_root, args.tag, args.dataset, results_dir_suffix)
+                # else:
+                    # results_dir = os.path.join(result_root, args.dataset, results_dir_suffix)
+                plots_dir = results_dir
+                os.makedirs(f"{results_dir}", exist_ok=True)
+
+                # save arguments to file
+                with open(f"{results_dir}/args.yaml", "w") as f:
+                    yaml.dump(vars(args), f)
+
+                print("Results will be saved to", results_dir)
+
+                for seed in seeds:
+                    print(f"=========== N-Shot = {n_shot}, A-Shot = {a_shot}, Seed = {seed} ===========")
+
+                    if os.path.exists(f"{results_dir}/metrics_seed={seed}.json"):
+                        print(f"Results for N-Shot = {n_shot}, A-Shot = {a_shot}, Seed = {seed} already exist. Skipping.")
+                        continue
                     else:
-                        print(f"Warning: {name} not in model state_dict.")
-            model.eval()
+                        timeit_file = results_dir + "/time_measurements.csv"
+                        with open(timeit_file, 'w', newline='') as file:
+                            writer = csv.writer(file)
+                            writer.writerow(["Object", "Sample", "Anomaly_Score", "MemoryBank_Time", "Inference_Time"])
 
-            results_dir_suffix = f"{n_shot}-n_shot_{a_shot}-a_shot"
-            results_dir = os.path.join(result_root, args.tag, args.dataset, results_dir_suffix)
-            # else:
-                # results_dir = os.path.join(result_root, args.dataset, results_dir_suffix)
-            plots_dir = results_dir
-            os.makedirs(f"{results_dir}", exist_ok=True)
+                            for object_name in objects:
+                                anomaly_scores, time_inference = run_anomaly_detection(
+                                                                                        args,
+                                                                                        model,
+                                                                                        object_name,
+                                                                                        data_root = args.data_root,
+                                                                                        object_anomalies = object_anomalies,
+                                                                                        plots_dir = plots_dir,
+                                                                                        seed = seed,
+                                                                                        save_patch_dists = cls, # save patch distances for detection evaluation
+                                                                                        save_tiffs = seg)      # save anomaly maps as tiffs for segmentation evaluation
 
-            # save arguments to file
-            with open(f"{results_dir}/args.yaml", "w") as f:
-                yaml.dump(vars(args), f)
+                                # write anomaly scores and inference times to file
+                                for counter, sample in enumerate(anomaly_scores.keys()):
+                                    anomaly_score = anomaly_scores[sample]
+                                    inference_time = time_inference[sample]
+                                    writer.writerow([object_name, sample, f"{anomaly_score:.5f}", f"{inference_time:.5f}"])
 
-            print("Results will be saved to", results_dir)
-        
-            for seed in seeds:
-                print(f"=========== N-Shot = {n_shot}, A-Shot = {a_shot}, Seed = {seed} ===========")
-                
-                if os.path.exists(f"{results_dir}/metrics_seed={seed}.json"):
-                    print(f"Results for N-Shot = {n_shot}, A-Shot = {a_shot}, Seed = {seed} already exist. Skipping.")
-                    continue
-                else:
-                    timeit_file = results_dir + "/time_measurements.csv"
-                    with open(timeit_file, 'w', newline='') as file:
-                        writer = csv.writer(file)
-                        writer.writerow(["Object", "Sample", "Anomaly_Score", "MemoryBank_Time", "Inference_Time"])
+                        # read inference times from file
+                        with open(timeit_file, 'r') as file:
+                            reader = csv.reader(file)
+                            next(reader)
+                            inference_times = [float(row[3]) for row in reader]
+                        print(f"Finished AD for {len(objects)} objects (seed {seed}), mean inference time: {sum(inference_times)/len(inference_times):.5f} s/sample")
 
-                        for object_name in objects:             
-                            anomaly_scores, time_inference = run_anomaly_detection(
-                                                                                    args,
-                                                                                    model,
-                                                                                    object_name,
-                                                                                    data_root = args.data_root, 
-                                                                                    object_anomalies = object_anomalies,
-                                                                                    plots_dir = plots_dir,
-                                                                                    seed = seed,
-                                                                                    save_patch_dists = args.eval_clf, # save patch distances for detection evaluation
-                                                                                    save_tiffs = args.eval_segm)      # save anomaly maps as tiffs for segmentation evaluation
-                            
-                            # write anomaly scores and inference times to file
-                            for counter, sample in enumerate(anomaly_scores.keys()):
-                                anomaly_score = anomaly_scores[sample]
-                                inference_time = time_inference[sample]
-                                writer.writerow([object_name, sample, f"{anomaly_score:.5f}", f"{inference_time:.5f}"])
+                        # evaluate all finished runs and create sample anomaly maps for inspection
+                        print(f"=========== Evaluate seed = {seed} ===========")
+                        eval_finished_run(args.dataset,
+                                        args.data_root,
+                                        anomaly_maps_dir = results_dir + f"/anomaly_maps/seed={seed}",
+                                        output_dir = results_dir,
+                                        seed = seed,
+                                        pro_integration_limit = 0.3,
+                                        eval_clf = cls,
+                                        eval_segm = seg)
 
-                    # read inference times from file
-                    with open(timeit_file, 'r') as file:
-                        reader = csv.reader(file)
-                        next(reader)
-                        inference_times = [float(row[3]) for row in reader]
-                    print(f"Finished AD for {len(objects)} objects (seed {seed}), mean inference time: {sum(inference_times)/len(inference_times):.5f} s/sample")
+                    # delete after generating metrics
+                    if delete_anomlay_maps:
+                        os.system(f"rm -r {results_dir}/anomaly_maps/seed={seed}")
 
-                    # evaluate all finished runs and create sample anomaly maps for inspection
-                    print(f"=========== Evaluate seed = {seed} ===========")
-                    eval_finished_run(args.dataset, 
-                                    args.data_root, 
-                                    anomaly_maps_dir = results_dir + f"/anomaly_maps/seed={seed}", 
-                                    output_dir = results_dir,
-                                    seed = seed,
-                                    pro_integration_limit = 0.3,
-                                    eval_clf = args.eval_clf,
-                                    eval_segm = args.eval_segm)
+        print("Finished and evaluated all runs!")
 
-                # delete after generating metrics
-                if delete_anomlay_maps:
-                    os.system(f"rm -r {results_dir}/anomaly_maps/seed={seed}")
-
-    print("Finished and evaluated all runs!")
+    if args.eval_clf is True:
+        evaluation(True, False, 'i')
+    if args.eval_segm is True:
+        evaluation(False, True, 'p')
